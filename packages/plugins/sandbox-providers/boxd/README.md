@@ -23,8 +23,8 @@ pnpm build
 From the Paperclip checkout, with your instance running:
 
 ```sh
-pnpm paperclipai plugin install /absolute/path/to/paperclip/packages/plugins/sandbox-providers/boxd
-pnpm paperclipai plugin inspect paperclip.boxd-sandbox-provider
+node cli/node_modules/tsx/dist/cli.mjs cli/src/index.ts plugin install /absolute/path/to/paperclip/packages/plugins/sandbox-providers/boxd
+node cli/node_modules/tsx/dist/cli.mjs cli/src/index.ts plugin inspect paperclip.boxd-sandbox-provider
 ```
 
 ## Configure an environment
@@ -90,7 +90,7 @@ sessions, incremental output, duplex channels and runner ingress are not
 advertised. Workspace transfer uses the host's base64-over-exec fallback.
 boxd has one region (EU), amd64 machines only, and no GPUs.
 
-## Opt-in live smoke
+## Opt-in live tests
 
 Default tests use a mocked SDK and do not contact boxd. To run against boxd,
 export `BOXD_API_KEY` (and optionally `BOXD_ORG`), then run:
@@ -99,11 +99,28 @@ export `BOXD_API_KEY` (and optionally `BOXD_ORG`), then run:
 BOXD_LIVE_TEST=1 pnpm test
 ```
 
-The live test acquires a machine, checks stdin, env, exit codes and stderr,
-round-trips a 5 MiB file through the base64-over-exec path, checks a command
-timeout, suspends and resumes the machine with a file and a running process
-kept, stops and resumes it, and deletes it in `finally`. It prints timings and
-no credentials.
+The live tests run every hook against boxd. They check:
+
+- config validation, and a probe with a sized machine that deletes the machine
+  afterwards (a bad API key returns a failed probe);
+- the labels, the isolation and the org of an acquired machine;
+- stdin, env, argument quoting, exit codes and stderr, and the removal of the
+  staged stdin file;
+- a 5 MiB round trip through the base64-over-exec path;
+- that a command timeout returns `timedOut` and ends the remote processes;
+- suspend and resume with a file and a running process kept, stop and resume
+  with the file kept, and inspect in each state;
+- a command on a stopped machine, which starts the machine and runs;
+- resume and stop of a hibernated machine, stop of a suspended machine, and a
+  release with `cancelActiveWork` or `stop_and_retain`;
+- a release without reuse, which deletes the machine;
+- a `requestedExpiresAt` that boxd enforces by deleting the machine;
+- a run restored from a snapshot, and a fresh machine at the configured size;
+- that resume after destroy reports an expired lease, and that no test
+  machines are left.
+
+Each test deletes its machines in `finally`. The tests print timings and no
+credentials. A full run takes about two minutes.
 
 ## Optional managed-image inclusion
 
