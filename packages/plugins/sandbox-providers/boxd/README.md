@@ -57,7 +57,8 @@ Claude Code, Codex and OpenCode on the PATH. It meets
 setup step. Use a snapshot to add other agent CLIs.
 
 The probe creates a machine, prepares the workspace and deletes the machine.
-It uses real boxd resources.
+It uses real boxd resources. The probe machine also has a 15-minute boxd delete
+timer, and a probe whose machine could not be deleted reports a failure.
 
 ## Implemented behavior
 
@@ -71,6 +72,15 @@ It uses real boxd resources.
 - Commands run through `sh` in the workspace, with quoted arguments,
   per-command environment, staged stdin, and separate stdout and stderr. A
   command timeout ends the remote process group and returns `timedOut: true`.
+- Stdin is staged with boxd's file API in a file only the machine user can
+  read, and removed after the command. The workspace directory is created the
+  same way. A machine whose boxd agent predates the file API, such as one
+  restored from an older snapshot, falls back to the older upload and `mkdir`
+  calls.
+- A failed acquisition deletes its machine. If boxd cannot confirm the
+  deletion, the plugin throws `PluginEnvironmentCreationCleanupError` with the
+  machine ID, so the host records it and retries the teardown. The destroy hook
+  checks that the machine's labels match before it deletes it.
 - A command on a stopped machine starts the machine and runs the command one
   more time. A suspended or hibernated machine wakes on the command.
 - Release deletes the machine and returns a receipt only after boxd no longer
@@ -106,6 +116,7 @@ The live tests run every hook against boxd. They check:
 - the labels, the isolation and the org of an acquired machine;
 - stdin, env, argument quoting, exit codes and stderr, and the removal of the
   staged stdin file;
+- an empty stdin, and a staged stdin file that only the machine user can read;
 - a 5 MiB round trip through the base64-over-exec path;
 - that a command timeout returns `timedOut` and ends the remote processes;
 - suspend and resume with a file and a running process kept, stop and resume

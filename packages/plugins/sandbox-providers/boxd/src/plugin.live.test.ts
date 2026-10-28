@@ -119,6 +119,13 @@ describe.skipIf(!live)("boxd live", () => {
       });
       expect(staged.stdout.trim()).toBe("0");
 
+      const emptyStdin = await hooks.onEnvironmentExecute!({ ...params, lease, command: "wc", args: ["-c"], stdin: "" });
+      expect(emptyStdin).toMatchObject({ exitCode: 0, stdout: "0\n" });
+      const stdinMode = await hooks.onEnvironmentExecute!({
+        ...params, lease, command: "sh", args: ["-c", "stat -c %a \"$(readlink /proc/self/fd/0)\""], stdin: "private",
+      });
+      expect(stdinMode.stdout.trim()).toBe("600");
+
       const quoted = await hooks.onEnvironmentExecute!({
         ...params, lease, command: "printf", args: ["%s|", "it's", "$HOME", "a b"],
       });

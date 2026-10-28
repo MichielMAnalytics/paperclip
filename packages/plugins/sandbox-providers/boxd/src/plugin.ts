@@ -1,9 +1,14 @@
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { Boxd, BoxdError, ConflictError, NotFoundError } from "@boxd-sh/sdk";
+import { AgentOutdatedError, Boxd, BoxdError, ConflictError, FilesystemError, NotFoundError } from "@boxd-sh/sdk";
 import type { Machine } from "@boxd-sh/sdk";
-import { definePlugin } from "@paperclipai/plugin-sdk";
+import {
+  definePlugin,
+  PluginEnvironmentCreationCleanupError,
+  readEnvironmentCreationCleanupError,
+} from "@paperclipai/plugin-sdk";
 import type {
+  PluginEnvironmentCreationCleanup,
   PluginEnvironmentAcquireLeaseParams,
   PluginEnvironmentDestroyLeaseParams,
   PluginEnvironmentExecuteParams,
@@ -37,6 +42,10 @@ const READY_TIMEOUT_MS = 120_000;
 const STATE_CONFIRM_TIMEOUT_MS = 60_000;
 const STATE_POLL_INTERVAL_MS = 250;
 const EXPIRY_MARGIN_SECONDS = 5;
+const PROBE_DELETE_AFTER_SECONDS = 900;
+const STDIN_MODE = 0o600;
+const CREATION_CLEANUP_SCHEMA = "paperclip/environment-creation-cleanup/v1";
+const CLEANUP_IDENTIFIER = /^[a-zA-Z0-9_-]{1,200}$/;
 const WORKSPACE_DIR = "paperclip-workspace";
 const FALLBACK_HOME = "/home/boxd";
 const MEMORY_BY_VCPU: Record<number, string> = { 1: "4G", 2: "8G", 4: "16G", 8: "32G" };
@@ -86,12 +95,15 @@ function resolveApiKey(config: BoxdDriverConfig): string {
   return envApiKey;
 }
 
+function accountFingerprint(config: BoxdDriverConfig): string {
+  return createHash("sha256").update(resolveApiKey(config)).digest("hex");
+}
+
 function clientFor(config: BoxdDriverConfig): Boxd {
-  const apiKey = resolveApiKey(config);
-  const cacheKey = createHash("sha256").update(apiKey).digest("hex");
+  const cacheKey = accountFingerprint(config);
   let client = clients.get(cacheKey);
   if (!client) {
-    client = new Boxd({ apiKey });
+    client = new Boxd({ apiKey: resolveApiKey(config) });
     clients.set(cacheKey, client);
   }
   return client;
@@ -147,16 +159,15 @@ function expirySeconds(requestedExpiresAt: string, now: number): number {
 async function createMachine(
   client: Boxd,
   config: BoxdDriverConfig,
-  input: { name: string; labels: Record<string, string>; deleteAfter?: number },
+  input: { name: string; labels: Record<string, string> },
 ): Promise<Machine> {
   const common = {
     name: input.name,
     ...(config.org ? { org: config.org } : {}),
     isolated: true,
     labels: input.labels,
-    ...(input.deleteAfter ? { deleteAfter: input.deleteAfter } : {}),
   };
-  const machine = config.snapshot
+  return config.snapshot
     ? await client.machines.create({
         ...common,
         fromSnapshot: config.snapshot,
@@ -169,12 +180,56 @@ async function createMachine(
           ...(config.vcpu ? { vcpu: config.vcpu, memory: MEMORY_BY_VCPU[config.vcpu] } : {}),
         },
       });
+}
+
+async function boundLifetime(client: Boxd, machineId: string, requestedExpiresAt: string): Promise<string> {
+  const deleteAt = await client.machines.setDeleteAfter(machineId, expirySeconds(requestedExpiresAt, Date.now()));
+  const requested = Date.parse(requestedExpiresAt);
+  return new Date(Math.min(deleteAt?.getTime() ?? requested, requested)).toISOString();
+}
+
+function creationCleanup(
+  config: BoxdDriverConfig,
+  machineId: string,
+  owner: { companyId: string; environmentId: string; runId: string },
+  labels: Record<string, string>,
+): PluginEnvironmentCreationCleanup {
+  return {
+    providerLeaseId: machineId,
+    companyId: owner.companyId,
+    environmentId: owner.environmentId,
+    runId: owner.runId,
+    attemptId: randomUUID(),
+    accountFingerprint: accountFingerprint(config),
+    labels: Object.fromEntries(Object.entries(labels).filter(([, value]) => CLEANUP_IDENTIFIER.test(value))),
+  };
+}
+
+async function machineOrNull(client: Boxd, machineId: string): Promise<Machine | null> {
   try {
-    await client.machines.waitUntilReady(machine.id, { timeout: READY_TIMEOUT_MS });
-    return machine;
+    return await client.machines.get(machineId);
   } catch (error) {
-    await destroyMachine(client, machine.id).catch(() => undefined);
+    if (error instanceof NotFoundError) return null;
     throw error;
+  }
+}
+
+async function checkFailedCreation(
+  client: Boxd,
+  config: BoxdDriverConfig,
+  params: PluginEnvironmentDestroyLeaseParams,
+): Promise<void> {
+  const cleanup = readEnvironmentCreationCleanupError({
+    data: { schema: CREATION_CLEANUP_SCHEMA, cleanup: params.leaseMetadata?.failedCreateCleanup },
+  });
+  const matches = cleanup !== null
+    && cleanup.companyId === params.companyId
+    && cleanup.environmentId === params.environmentId
+    && cleanup.providerLeaseId === params.providerLeaseId
+    && cleanup.accountFingerprint === accountFingerprint(config);
+  const machine = matches ? await machineOrNull(client, cleanup.providerLeaseId) : null;
+  if (!matches || (machine && Object.entries(cleanup.labels).some(([key, value]) => machine.labels[key] !== value))) {
+    throw new Error("The failed-creation cleanup does not match a boxd machine that this environment created.");
   }
 }
 
@@ -198,6 +253,15 @@ async function confirmState(
       throw new Error(`boxd did not confirm that machine ${machineId} is ${description} (last status: ${machine?.status ?? "missing"}).`);
     }
     await sleep(STATE_POLL_INTERVAL_MS);
+  }
+}
+
+async function withAgentFallback(work: () => Promise<void>, fallback: () => Promise<void>): Promise<void> {
+  try {
+    await work();
+  } catch (error) {
+    if (!(error instanceof AgentOutdatedError)) throw error;
+    await fallback();
   }
 }
 
@@ -276,12 +340,22 @@ async function detectHome(client: Boxd, machineId: string): Promise<string> {
   return home && home.startsWith("/") ? home : FALLBACK_HOME;
 }
 
-async function ensureWorkspace(client: Boxd, machineId: string, remoteCwd: string): Promise<void> {
-  const result = await withStartedMachine(client, machineId, () =>
-    client.machines.exec(machineId, { command: `mkdir -p ${shellQuote(remoteCwd)}` }),
-  );
+async function makeWorkspaceWithShell(client: Boxd, machineId: string, remoteCwd: string): Promise<void> {
+  const result = await client.machines.exec(machineId, { command: `mkdir -p ${shellQuote(remoteCwd)}` });
   if (result.exitCode !== 0) {
     throw new Error(`Failed to create ${remoteCwd} on boxd machine ${machineId}: ${result.stderr.trim() || result.stdout.trim()}`);
+  }
+}
+
+async function ensureWorkspace(client: Boxd, machineId: string, remoteCwd: string): Promise<void> {
+  try {
+    await withStartedMachine(client, machineId, () => withAgentFallback(
+      () => client.machines.fs.mkdir(machineId, remoteCwd),
+      () => makeWorkspaceWithShell(client, machineId, remoteCwd),
+    ));
+  } catch (error) {
+    if (!(error instanceof FilesystemError)) throw error;
+    throw new Error(`Failed to create ${remoteCwd} on boxd machine ${machineId}: ${error.message}`);
   }
 }
 
@@ -336,26 +410,43 @@ function buildLoginShellScript(input: {
 
 async function acquireMachine(
   config: BoxdDriverConfig,
-  input: { name: string; labels: Record<string, string>; requestedCwd?: string; requestedExpiresAt?: string | null },
+  input: {
+    companyId: string;
+    environmentId: string;
+    runId: string;
+    requestedCwd?: string;
+    requestedExpiresAt?: string | null;
+  },
 ): Promise<PluginEnvironmentLease> {
   const client = clientFor(config);
-  const startedAt = Date.now();
-  const deleteAfter = input.requestedExpiresAt ? expirySeconds(input.requestedExpiresAt, startedAt) : undefined;
-  const machine = await createMachine(client, config, { name: input.name, labels: input.labels, deleteAfter });
+  if (input.requestedExpiresAt) expirySeconds(input.requestedExpiresAt, Date.now());
+  const labels = machineLabels(input.environmentId, input.runId);
+  const machine = await createMachine(client, config, {
+    name: buildMachineName(config, input.environmentId, input.runId),
+    labels,
+  });
   try {
+    const expiresAt = input.requestedExpiresAt
+      ? await boundLifetime(client, machine.id, input.requestedExpiresAt)
+      : undefined;
+    await client.machines.waitUntilReady(machine.id, { timeout: READY_TIMEOUT_MS });
     const remoteCwd = input.requestedCwd?.trim() || path.posix.join(await detectHome(client, machine.id), WORKSPACE_DIR);
     await ensureWorkspace(client, machine.id, remoteCwd);
-    const lease: PluginEnvironmentLease = {
+    return {
       providerLeaseId: machine.id,
       metadata: leaseMetadata({ config, machine, remoteCwd, resumedLease: false }),
+      ...(expiresAt ? { expiresAt } : {}),
     };
-    if (deleteAfter && input.requestedExpiresAt) {
-      const providerExpiry = Math.min(Date.now() + deleteAfter * 1000, Date.parse(input.requestedExpiresAt));
-      lease.expiresAt = new Date(providerExpiry).toISOString();
-    }
-    return lease;
   } catch (error) {
-    await destroyMachine(client, machine.id).catch(() => undefined);
+    try {
+      await destroyMachine(client, machine.id);
+    } catch (cleanupError) {
+      throw new PluginEnvironmentCreationCleanupError(
+        [error, cleanupError],
+        `boxd machine ${machine.id} could not be deleted after its acquisition failed.`,
+        creationCleanup(config, machine.id, input, labels),
+      );
+    }
     throw error;
   }
 }
@@ -408,56 +499,62 @@ const plugin = definePlugin({
     params: PluginEnvironmentProbeParams,
   ): Promise<PluginEnvironmentProbeResult> {
     const config = parseDriverConfig(params.config);
-    let machineId: string | null = null;
+    const configMetadata = {
+      provider: "boxd",
+      org: config.org,
+      snapshot: config.snapshot,
+      timeoutMs: config.timeoutMs,
+      reuseLease: config.reuseLease,
+    };
+    let machine: Machine | null = null;
+    let result: PluginEnvironmentProbeResult;
     try {
       const client = clientFor(config);
-      const machine = await createMachine(client, config, {
+      machine = await createMachine(client, config, {
         name: `${config.namePrefix}-probe-${randomUUID().slice(0, 8)}`,
         labels: machineLabels(params.environmentId, "probe"),
       });
-      machineId = machine.id;
+      await client.machines.setDeleteAfter(machine.id, PROBE_DELETE_AFTER_SECONDS);
+      await client.machines.waitUntilReady(machine.id, { timeout: READY_TIMEOUT_MS });
       const remoteCwd = path.posix.join(await detectHome(client, machine.id), WORKSPACE_DIR);
       await ensureWorkspace(client, machine.id, remoteCwd);
-      return {
+      result = {
         ok: true,
         summary: `Connected to boxd machine ${machine.name}.`,
-        metadata: {
-          provider: "boxd",
-          machineName: machine.name,
-          org: config.org,
-          snapshot: config.snapshot,
-          timeoutMs: config.timeoutMs,
-          reuseLease: config.reuseLease,
-          remoteCwd,
-        },
+        metadata: { ...configMetadata, machineName: machine.name, remoteCwd },
       };
+    } catch (error) {
+      result = {
+        ok: false,
+        summary: "boxd environment probe failed.",
+        metadata: { ...configMetadata, error: formatErrorMessage(error) },
+      };
+    }
+    if (!machine) return result;
+    try {
+      await destroyMachine(clientFor(config), machine.id);
+      return result;
     } catch (error) {
       return {
         ok: false,
-        summary: "boxd environment probe failed.",
+        summary: `boxd environment probe could not delete its machine ${machine.name}.`,
         metadata: {
-          provider: "boxd",
-          org: config.org,
-          snapshot: config.snapshot,
-          timeoutMs: config.timeoutMs,
-          reuseLease: config.reuseLease,
-          error: formatErrorMessage(error),
+          ...result.metadata,
+          machineId: machine.id,
+          machineName: machine.name,
+          cleanupError: formatErrorMessage(error),
         },
       };
-    } finally {
-      if (machineId) {
-        await destroyMachine(clientFor(config), machineId).catch(() => undefined);
-      }
     }
   },
 
   async onEnvironmentAcquireLease(
     params: PluginEnvironmentAcquireLeaseParams,
   ): Promise<PluginEnvironmentLease> {
-    const config = parseDriverConfig(params.config);
-    return await acquireMachine(config, {
-      name: buildMachineName(config, params.environmentId, params.runId),
-      labels: machineLabels(params.environmentId, params.runId),
+    return await acquireMachine(parseDriverConfig(params.config), {
+      companyId: params.companyId,
+      environmentId: params.environmentId,
+      runId: params.runId,
       requestedCwd: params.requestedCwd,
       requestedExpiresAt: params.requestedExpiresAt,
     });
@@ -519,7 +616,9 @@ const plugin = definePlugin({
   ): Promise<PluginEnvironmentTerminationReceipt | void> {
     if (!params.providerLeaseId) return;
     const config = parseDriverConfig(params.config);
-    return await destroyMachine(clientFor(config), params.providerLeaseId);
+    const client = clientFor(config);
+    if (params.leaseMetadata?.failedCreateCleanup !== undefined) await checkFailedCreation(client, config, params);
+    return await destroyMachine(client, params.providerLeaseId);
   },
 
   async onEnvironmentInspectLease(
@@ -587,7 +686,17 @@ const plugin = definePlugin({
 
     try {
       const result = await withStartedMachine(client, machineId, async () => {
-        if (stdinPath) await client.machines.files.upload(machineId, stdinPath, params.stdin ?? "");
+        if (stdinPath) {
+          const stdin = params.stdin ?? "";
+          await withAgentFallback(
+            async () => {
+              await client.machines.fs.write(machineId, stdinPath, stdin, { mode: STDIN_MODE });
+            },
+            async () => {
+              await client.machines.files.upload(machineId, stdinPath, stdin);
+            },
+          );
+        }
         return await client.machines.exec(machineId, { command, ...(cwd ? { cwd } : {}), timeout: timeoutMs });
       });
       return {
@@ -608,7 +717,10 @@ const plugin = definePlugin({
       throw error;
     } finally {
       if (stdinPath) {
-        await client.machines.files.delete(machineId, stdinPath).catch(() => undefined);
+        await withAgentFallback(
+          () => client.machines.fs.remove(machineId, stdinPath),
+          () => client.machines.files.delete(machineId, stdinPath),
+        ).catch(() => undefined);
       }
     }
   },

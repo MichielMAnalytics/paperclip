@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+import { PluginEnvironmentCreationCleanupError } from "@paperclipai/plugin-sdk";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const sdk = vi.hoisted(() => {
@@ -11,6 +13,8 @@ const sdk = vi.hoisted(() => {
   }
   class NotFoundError extends BoxdError {}
   class ConflictError extends BoxdError {}
+  class AgentOutdatedError extends ConflictError {}
+  class FilesystemError extends BoxdError {}
   const machines = {
     create: vi.fn(),
     get: vi.fn(),
@@ -22,9 +26,15 @@ const sdk = vi.hoisted(() => {
     wake: vi.fn(),
     start: vi.fn(),
     stop: vi.fn(),
+    setDeleteAfter: vi.fn(),
     files: {
       upload: vi.fn(),
       delete: vi.fn(),
+    },
+    fs: {
+      write: vi.fn(),
+      remove: vi.fn(),
+      mkdir: vi.fn(),
     },
   };
   const constructed: Array<{ apiKey?: string }> = [];
@@ -37,7 +47,7 @@ const sdk = vi.hoisted(() => {
       constructed.push(options);
     }
   }
-  return { Boxd, BoxdError, NotFoundError, ConflictError, machines, constructed, close };
+  return { Boxd, BoxdError, NotFoundError, ConflictError, AgentOutdatedError, FilesystemError, machines, constructed, close };
 });
 
 vi.mock("@boxd-sh/sdk", () => ({
@@ -45,6 +55,8 @@ vi.mock("@boxd-sh/sdk", () => ({
   BoxdError: sdk.BoxdError,
   NotFoundError: sdk.NotFoundError,
   ConflictError: sdk.ConflictError,
+  AgentOutdatedError: sdk.AgentOutdatedError,
+  FilesystemError: sdk.FilesystemError,
 }));
 
 import plugin from "./plugin.js";
@@ -78,8 +90,12 @@ describe("boxd sandbox provider plugin", () => {
     machines.exec.mockImplementation(async (_id: string, params: { command: string }) =>
       params.command.startsWith("printf") ? execOk("/home/boxd\n") : execOk(),
     );
+    machines.setDeleteAfter.mockImplementation(async (_id: string, seconds: number) => new Date(Date.now() + seconds * 1000));
     machines.files.upload.mockResolvedValue(12);
     machines.files.delete.mockResolvedValue(undefined);
+    machines.fs.write.mockResolvedValue({ size: 8 });
+    machines.fs.remove.mockResolvedValue(undefined);
+    machines.fs.mkdir.mockResolvedValue(undefined);
   });
 
   it("declares environment lifecycle handlers", async () => {
@@ -152,7 +168,8 @@ describe("boxd sandbox provider plugin", () => {
       config: { autoSuspendTimeout: 0, vcpu: 2, memory: "8G" },
     });
     expect(machines.waitUntilReady).toHaveBeenCalledWith("vm-1", { timeout: 120000 });
-    expect(machines.exec).toHaveBeenLastCalledWith("vm-1", { command: "mkdir -p '/home/boxd/paperclip-workspace'" });
+    expect(machines.fs.mkdir).toHaveBeenCalledWith("vm-1", "/home/boxd/paperclip-workspace");
+    expect(machines.setDeleteAfter).not.toHaveBeenCalled();
     expect(result).toEqual({
       providerLeaseId: "vm-1",
       metadata: {
@@ -184,10 +201,20 @@ describe("boxd sandbox provider plugin", () => {
   it("bounds the machine lifetime at or before a requested expiry", async () => {
     const requestedExpiresAt = new Date(Date.now() + 600_000).toISOString();
     const result = await hooks.onEnvironmentAcquireLease?.({ ...base, runId: "run-1", config: { apiKey: "bxd_test" }, requestedExpiresAt });
-    const deleteAfter = machines.create.mock.calls[0][0].deleteAfter as number;
+    expect(machines.create.mock.calls[0][0]).not.toHaveProperty("deleteAfter");
+    const [id, deleteAfter] = machines.setDeleteAfter.mock.calls[0];
+    expect(id).toBe("vm-1");
     expect(deleteAfter).toBeGreaterThan(580);
     expect(deleteAfter).toBeLessThanOrEqual(595);
     expect(Date.parse(result!.expiresAt!)).toBeLessThanOrEqual(Date.parse(requestedExpiresAt));
+  });
+
+  it("deletes the machine when its lifetime cannot be bounded", async () => {
+    machines.setDeleteAfter.mockRejectedValue(new sdk.BoxdError("unavailable", 14));
+    const requestedExpiresAt = new Date(Date.now() + 600_000).toISOString();
+    await expect(hooks.onEnvironmentAcquireLease?.({ ...base, runId: "run-1", config: { apiKey: "bxd_test" }, requestedExpiresAt }))
+      .rejects.toThrow("unavailable");
+    expect(machines.delete).toHaveBeenCalledWith("vm-1");
   });
 
   it("refuses an expiry it cannot honor before creating anything", async () => {
@@ -201,12 +228,60 @@ describe("boxd sandbox provider plugin", () => {
   });
 
   it("deletes the machine when workspace setup fails", async () => {
-    machines.exec.mockImplementation(async (_id: string, params: { command: string }) =>
-      params.command.startsWith("printf") ? execOk("/home/boxd\n") : execOk("", "read-only file system", 1),
-    );
+    machines.fs.mkdir.mockRejectedValue(new sdk.FilesystemError("/home/boxd/paperclip-workspace: Read-only file system"));
     await expect(hooks.onEnvironmentAcquireLease?.({ ...base, runId: "run-1", config: { apiKey: "bxd_test" } }))
-      .rejects.toThrow(/read-only file system/);
+      .rejects.toThrow("Failed to create /home/boxd/paperclip-workspace on boxd machine vm-1: /home/boxd/paperclip-workspace: Read-only file system");
     expect(machines.delete).toHaveBeenCalledWith("vm-1");
+  });
+
+  it("hands the host the machine when it cannot be deleted after a failed acquisition", async () => {
+    machines.waitUntilReady.mockRejectedValue(new sdk.BoxdError("not ready", 4));
+    machines.delete.mockRejectedValue(new sdk.BoxdError("unavailable", 14));
+    const error = await hooks.onEnvironmentAcquireLease?.({
+      ...base,
+      runId: "run-12345678-xyz",
+      config: { apiKey: "bxd_test" },
+    }).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(PluginEnvironmentCreationCleanupError);
+    const cleanupError = error as PluginEnvironmentCreationCleanupError;
+    expect(cleanupError.errors.map((cause) => (cause as Error).message)).toEqual(["not ready", "unavailable"]);
+    expect(cleanupError.cleanup).toEqual({
+      providerLeaseId: "vm-1",
+      companyId: "company-1",
+      environmentId: "env-12345678abc",
+      runId: "run-12345678-xyz",
+      attemptId: expect.stringMatching(/^[0-9a-f-]{36}$/),
+      accountFingerprint: createHash("sha256").update("bxd_test").digest("hex"),
+      labels: { "paperclip-provider": "boxd", "paperclip-environment": "env-12345678abc", "paperclip-run": "run-12345678-xyz" },
+    });
+  });
+
+  it("destroys a failed creation the host hands back only when it matches the machine", async () => {
+    const failedCreateCleanup = {
+      providerLeaseId: "vm-1",
+      companyId: "company-1",
+      environmentId: "env-12345678abc",
+      runId: "run-1",
+      attemptId: "attempt-1",
+      accountFingerprint: createHash("sha256").update("bxd_test").digest("hex"),
+      labels: { "paperclip-provider": "boxd", "paperclip-run": "run-1" },
+    };
+    const owned = machine({ labels: { "paperclip-provider": "boxd", "paperclip-run": "run-1" } } as never);
+    machines.get.mockResolvedValueOnce(owned).mockRejectedValue(new sdk.NotFoundError("not found", 5));
+    expect(await hooks.onEnvironmentDestroyLease?.({
+      ...base, config: { apiKey: "bxd_test" }, providerLeaseId: "vm-1", leaseMetadata: { failedCreateCleanup },
+    })).toEqual({ providerLeaseId: "vm-1", state: "destroyed" });
+    expect(machines.delete).toHaveBeenCalledWith("vm-1");
+
+    machines.delete.mockClear();
+    machines.get.mockResolvedValue(machine({ labels: { "paperclip-provider": "boxd", "paperclip-run": "run-2" } } as never));
+    await expect(hooks.onEnvironmentDestroyLease?.({
+      ...base, config: { apiKey: "bxd_test" }, providerLeaseId: "vm-1", leaseMetadata: { failedCreateCleanup },
+    })).rejects.toThrow("does not match");
+    await expect(hooks.onEnvironmentDestroyLease?.({
+      ...base, config: { apiKey: "bxd_other" }, providerLeaseId: "vm-1", leaseMetadata: { failedCreateCleanup },
+    })).rejects.toThrow("does not match");
+    expect(machines.delete).not.toHaveBeenCalled();
   });
 
   it("reuses one client per API key", async () => {
@@ -243,13 +318,34 @@ describe("boxd sandbox provider plugin", () => {
     expect(machines.exec.mock.calls[0][1].timeout).toBe(1234);
   });
 
-  it("stages stdin in a temporary file and removes it afterwards", async () => {
+  it("stages stdin in a private temporary file and removes it afterwards", async () => {
     await hooks.onEnvironmentExecute?.({ ...base, config: { apiKey: "bxd_test" }, lease: lease(), command: "cat", stdin: "payload\n" });
-    const [, stdinPath, contents] = machines.files.upload.mock.calls[0];
+    const [, stdinPath, contents, options] = machines.fs.write.mock.calls[0];
     expect(stdinPath).toMatch(/^\/tmp\/paperclip-stdin-/);
     expect(contents).toBe("payload\n");
+    expect(options).toEqual({ mode: 0o600 });
     expect(machines.exec.mock.calls[0][1].command).toMatch(new RegExp(`exec 'cat' < '${stdinPath}'$`));
+    expect(machines.fs.remove).toHaveBeenCalledWith("vm-1", stdinPath);
+    expect(machines.files.upload).not.toHaveBeenCalled();
+  });
+
+  it("stages an empty stdin", async () => {
+    await hooks.onEnvironmentExecute?.({ ...base, config: { apiKey: "bxd_test" }, lease: lease(), command: "cat", stdin: "" });
+    expect(machines.fs.write.mock.calls[0][2]).toBe("");
+  });
+
+  it("falls back to the older file calls on a machine whose boxd agent predates the filesystem API", async () => {
+    const outdated = () => new sdk.AgentOutdatedError("vm-1 was started before the filesystem API existed; reboot it to update it", 9);
+    machines.fs.write.mockRejectedValue(outdated());
+    machines.fs.remove.mockRejectedValue(outdated());
+    machines.fs.mkdir.mockRejectedValue(outdated());
+    await hooks.onEnvironmentExecute?.({ ...base, config: { apiKey: "bxd_test" }, lease: lease(), command: "cat", stdin: "payload\n" });
+    const [, stdinPath, contents] = machines.files.upload.mock.calls[0];
+    expect(contents).toBe("payload\n");
     expect(machines.files.delete).toHaveBeenCalledWith("vm-1", stdinPath);
+
+    await hooks.onEnvironmentRealizeWorkspace?.({ ...base, config: { apiKey: "bxd_test" }, lease: lease(), workspace: {} });
+    expect(machines.exec).toHaveBeenLastCalledWith("vm-1", { command: "mkdir -p '/home/boxd/paperclip-workspace'" });
   });
 
   it("reports an exec timeout as timedOut", async () => {
@@ -364,11 +460,22 @@ describe("boxd sandbox provider plugin", () => {
       .rejects.toThrow("unavailable");
   });
 
-  it("probes with a throwaway machine and deletes it", async () => {
+  it("probes with a throwaway machine that boxd deletes on a timer, and deletes it", async () => {
     const result = await hooks.onEnvironmentProbe?.({ ...base, config: { apiKey: "bxd_test" } });
     expect(result?.ok).toBe(true);
     expect(machines.create.mock.calls[0][0].name).toMatch(/^paperclip-probe-/);
+    expect(machines.setDeleteAfter).toHaveBeenCalledWith("vm-1", 900);
     expect(machines.delete).toHaveBeenCalledWith("vm-1");
+  });
+
+  it("fails a probe whose machine could not be deleted", async () => {
+    machines.delete.mockRejectedValue(new sdk.BoxdError("unavailable", 14));
+    const result = await hooks.onEnvironmentProbe?.({ ...base, config: { apiKey: "bxd_test" } });
+    expect(result).toMatchObject({
+      ok: false,
+      summary: "boxd environment probe could not delete its machine paperclip-env12345-run12345-abcd.",
+      metadata: { machineId: "vm-1", cleanupError: "unavailable", remoteCwd: "/home/boxd/paperclip-workspace" },
+    });
   });
 
   it("reports a probe failure without throwing", async () => {
